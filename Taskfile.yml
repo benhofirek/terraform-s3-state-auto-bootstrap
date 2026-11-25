@@ -1,0 +1,56 @@
+# yaml-language-server: $schema=https://taskfile.dev/schema.json
+
+version: '3'
+
+vars:
+  INFRA_DIR: './infrastructure'
+  BOOTSTRAP_DIR: '{{.INFRA_DIR}}/bootstrap'
+  MAIN_DIR: '{{.INFRA_DIR}}/main'
+
+tasks:
+  tf-init:
+    desc: Initialize terraform backend on S3
+    silent: true
+    preconditions:
+      - sh: "! tofu -chdir={{.MAIN_DIR}} state list >/dev/null"
+        msg: "✅ State is already initialized inside S3 bucket - skipping initialization."
+      - sh: test -n "$TF_VAR_state_bucket_name"
+        msg: "TF_VAR_state_bucket_name environment variable is required."
+      - sh: test -n "$TF_VAR_aws_region"
+        msg: "TF_VAR_aws_region environment variable is required."
+    cmds:
+      - defer: |
+          {{if .EXIT_CODE}}
+          echo "State initialization failed."
+          {{end}}
+      - defer:
+          task: cleanup
+      - echo ""
+      - echo "🚀 Starting terraform initialization"
+      - echo ""
+      - echo "📦 [1/4] Initializing local state..."
+      - tofu -chdir={{.BOOTSTRAP_DIR}} init >/dev/null
+      - echo "🪣 [2/4] Creating S3 state bucket (this might take a minute)..."
+      - tofu -chdir={{.BOOTSTRAP_DIR}} apply -auto-approve >/dev/null
+      - defer: |
+          {{if .EXIT_CODE}}
+          echo "Please delete orphaned S3 state bucket which was created during initialization attempt."
+          {{end}}
+      - echo "🚚 [3/4] Migrating local state to S3 bucket..."
+      - cp {{.BOOTSTRAP_DIR}}/terraform.tfstate {{.MAIN_DIR}}
+      - tofu -chdir={{.MAIN_DIR}} init -migrate-state -force-copy >/dev/null
+      - echo "🔍 [4/4] Verifying remote state is reachable..."
+      - tofu -chdir={{.MAIN_DIR}} state list >/dev/null
+      - echo ""
+      - echo "✅ Verification successful"
+      - echo ""
+      - echo "🎉 Initialization completed! Terraform state is now stored in S3 bucket."
+
+  cleanup:
+    desc: Remove local state, state backups and .terraform directories
+    internal: true
+    silent: true
+    cmds:
+      - find {{.BOOTSTRAP_DIR}} -type d -name .terraform -prune -exec rm -rf {} +
+      - find {{.BOOTSTRAP_DIR}} -type f \( -name '*.tfstate' -o -name '*.tfstate.*' -o -name '.terraform.lock.hcl' \) -delete
+      - find {{.MAIN_DIR}} -maxdepth 1 -type f \( -name '*.tfstate' -o -name '*.tfstate.*' \) -delete
